@@ -20,7 +20,7 @@ from .http_client import HttpClient, AsyncHttpClient
 # Constants
 F_GEN_URL = "https://nxapi-znca-api.fancy.org.uk/api/znca/f"
 F_GEN_OAUTH_URL = "https://nxapi-auth.fancy.org.uk/api/oauth/token"
-F_GEN_OAUTH_CLIENT_ID = "Orh4jxABP3D3jYaBFgL9Ug" # todo 研究一下这个值的来源
+F_GEN_OAUTH_CLIENT_ID = "EJ5mqnRSwmWfOPmRDIRGwg" 
 
 # Version (globals like in splatoon3-nso)
 NSOAPP_VERSION = "unknown"
@@ -28,7 +28,7 @@ NSOAPP_VER_FALLBACK = "3.2.0"
 WEB_VIEW_VERSION = "unknown"
 WEB_VIEW_VER_FALLBACK = "10.0.0-cba84fcd"
 ZNCA_CLIENT_VERSION = "unknown"  # 3.1.0+ 由 nxapi-auth 签发的随机客户端版本
-ZNCA_CLIENT_VER_FALLBACK = "3.0.3"  # 兼容旧协议的静态版本
+ZNCA_CLIENT_VER_FALLBACK = "hio87-mJks_e9GNF"  # 兼容旧协议的静态版本
 
 # User agents
 APP_USER_AGENT = (
@@ -118,7 +118,7 @@ class NSOAuth:
     
     @staticmethod
     def get_web_view_ver() -> str:
-        """获取 Web View 版本（参照 splatoon3-nso）"""
+        """获取 Web View 版本(参照 splatoon3-nso)"""
         global WEB_VIEW_VERSION
         if WEB_VIEW_VERSION != "unknown":
             return WEB_VIEW_VERSION
@@ -264,8 +264,8 @@ class NSOAuth:
         )
         
         # Step 3: Get g_token
-        g_token = await self._get_g_token(access_token, f, uuid, timestamp, coral_user_id)
-        
+        g_token = await self._get_g_token(access_token, coral_user_id)
+
         return access_token, g_token, self.user_nickname, self.user_lang, self.user_country, current_user
     
     async def _get_id_token_and_user_info(
@@ -335,104 +335,177 @@ class NSOAuth:
         self.user_country = user_info["country"]
         self.r_user_id = user_info["id"]
         birthday = user_info["birthday"]
-        
-        # Call f-API
-        f, uuid, timestamp = await self.call_f_api(id_token, 1, self.r_user_id)
-        
+
+        # 准备 parameter 用于加密请求
         parameter = {
-            "f": f,
+            "f": "",  # 将由 f-API 填充
             "language": self.user_lang,
             "naBirthday": birthday,
             "naCountry": self.user_country,
             "naIdToken": id_token,
-            "requestId": uuid,
-            "timestamp": timestamp,
+            "requestId": "",  # 将由 f-API 填充
+            "timestamp": 0,  # 将由 f-API 填充
         }
-        
-        nsoapp_version = self.get_nsoapp_version()
-        app_head = {
-            "X-Platform": "Android",
-            "X-ProductVersion": nsoapp_version,
-            "Content-Type": "application/json; charset=utf-8",
-            "Connection": "Keep-Alive",
-            "Accept-Encoding": "gzip",
-            "User-Agent": f"com.nintendo.znca/{nsoapp_version}(Android/14)",
+
+        # 调用 f-API 并请求加密数据
+        enc_req = {
+            "url": "https://api-lp1.znc.srv.nintendo.net/v4/Account/Login",
+            "parameter": parameter,
         }
-        
-        client = self._get_async_client()
-        resp = await client.post(
-            "https://api-lp1.znc.srv.nintendo.net/v3/Account/Login",
-            headers=app_head,
-            json={"parameter": parameter},
+        f, uuid, timestamp, enc_payload = await self.call_f_api(
+            id_token, 1, self.r_user_id, encrypt_token_request=enc_req
         )
-        splatoon_token = resp.json()
-        
+
+        # 更新 parameter
+        parameter["f"] = f
+        parameter["requestId"] = uuid
+        parameter["timestamp"] = timestamp
+
+        nsoapp_version = self.get_nsoapp_version()
+        znca_client_version = self.get_znca_client_version()
+
+        client = self._get_async_client()
+        url = "https://api-lp1.znc.srv.nintendo.net/v4/Account/Login"
+
+        # 根据是否有加密载荷决定请求模式
+        if enc_payload:
+            # 加密模式：base64 解码后发送二进制数据
+            print("[DEBUG] Using encrypted request mode")
+            body_bytes = base64.b64decode(enc_payload)
+
+            app_head = {
+                "X-Platform": "Android",
+                "X-ProductVersion": nsoapp_version,
+                "X-znca-Client-Version": znca_client_version,
+                "Content-Type": "application/octet-stream",
+                "Accept": "application/octet-stream, application/json",
+                "Connection": "Keep-Alive",
+                "Accept-Encoding": "gzip",
+                "User-Agent": f"com.nintendo.znca/{nsoapp_version}(Android/14)",
+            }
+
+            resp = await client.post(url, headers=app_head, content=body_bytes)
+
+            # 解密响应
+            decrypt_resp = await self.f_decrypt_response(resp.content)
+            decrypt_json = decrypt_resp.json()
+            splatoon_token = json.loads(decrypt_json["data"])
+        else:
+            # v4 API 强制加密，若未获取到加密载荷则为异常
+            raise ValueError(
+                "Failed to get encrypted payload from f-API. "
+                "v4 API requires encryption. Check OAuth client_id and scope."
+            )
+
         try:
             access_token = splatoon_token["result"]["webApiServerCredential"]["accessToken"]
             coral_user_id = splatoon_token["result"]["user"]["id"]
             current_user = splatoon_token["result"]["user"]
         except (KeyError, TypeError):
-            # Retry once (参照 splatoon3-nso retry logic  for 9403/9599/9427)
+            # Retry once (参照 splatoon3-nso retry logic for 9403/9599/9427)
             try:
                 print(f"[DEBUG] First attempt failed ({splatoon_token.get('status')}), retrying...")
-                f, uuid, timestamp = await self.call_f_api(id_token, 1, self.r_user_id)
+
+                # 重新生成 f
+                enc_req["parameter"] = parameter
+                f, uuid, timestamp, enc_payload = await self.call_f_api(
+                    id_token, 1, self.r_user_id, encrypt_token_request=enc_req
+                )
                 parameter["f"] = f
                 parameter["requestId"] = uuid
                 parameter["timestamp"] = timestamp
-                
-                resp = await client.post(
-                    "https://api-lp1.znc.srv.nintendo.net/v3/Account/Login",
-                    headers=app_head,
-                    json={"parameter": parameter},
-                )
-                splatoon_token = resp.json()
+
+                # 准备重试请求
+                if enc_payload:
+                    body_bytes = base64.b64decode(enc_payload)
+                    resp = await client.post(url, headers=app_head, content=body_bytes)
+                    decrypt_resp = await self.f_decrypt_response(resp.content)
+                    decrypt_json = decrypt_resp.json()
+                    splatoon_token = json.loads(decrypt_json["data"])
+                else:
+                    raise ValueError("Failed to get encrypted payload from f-API on retry")
+
                 access_token = splatoon_token["result"]["webApiServerCredential"]["accessToken"]
                 coral_user_id = splatoon_token["result"]["user"]["id"]
                 current_user = splatoon_token["result"]["user"]
+            except json.JSONDecodeError:
+                raise ValueError("JSONDecodeError")
             except Exception:
                 raise ValueError(f"Failed to get access_token: {splatoon_token}")
-        
-        # Get f for step 2
-        f, uuid, timestamp = await self.call_f_api(access_token, 2, self.r_user_id, coral_user_id)
-        
+
+        # Get f for step 2 (不再需要这一步，在 _get_g_token 中调用)
         return access_token, f, uuid, timestamp, coral_user_id, current_user
     
     async def _get_g_token(
         self,
         access_token: str,
-        f: str,
-        uuid: str,
-        timestamp: int,
         coral_user_id: str,
     ) -> str:
-        """get_gtoken 第三步（参照 S3S._get_g_token()）"""
+        """
+        get_gtoken 第三步（参照 S3S._get_g_token()）
+
+        注意：此方法会调用 f-API 重新生成 f/uuid/timestamp，不复用 step 1 的值
+        """
         nsoapp_version = self.get_nsoapp_version()
-        
-        app_head = {
-            "X-Platform": "Android",
-            "X-ProductVersion": nsoapp_version,
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json; charset=utf-8",
-            "Accept-Encoding": "gzip",
-            "User-Agent": f"com.nintendo.znca/{nsoapp_version}(Android/14)",
-        }
-        
+        znca_client_version = self.get_znca_client_version()
+
+        # 准备 parameter
         parameter = {
-            "f": f,
+            "f": "",  # 将由 f-API 填充
             "id": 4834290508791808,
             "registrationToken": access_token,
-            "requestId": uuid,
-            "timestamp": timestamp,
+            "requestId": "",  # 将由 f-API 填充
+            "timestamp": 0,  # 将由 f-API 填充
         }
-        
-        client = self._get_async_client()
-        resp = await client.post(
-            "https://api-lp1.znc.srv.nintendo.net/v2/Game/GetWebServiceToken",
-            headers=app_head,
-            json={"parameter": parameter},
+
+        url = "https://api-lp1.znc.srv.nintendo.net/v4/Game/GetWebServiceToken"
+
+        # 调用 f-API 并请求加密数据
+        enc_req = {
+            "url": url,
+            "parameter": parameter,
+        }
+        f, uuid, timestamp, enc_payload = await self.call_f_api(
+            access_token, 2, self.r_user_id, coral_user_id, encrypt_token_request=enc_req
         )
-        web_service_resp = resp.json()
-        
+
+        # 更新 parameter
+        parameter["f"] = f
+        parameter["requestId"] = uuid
+        parameter["timestamp"] = timestamp
+
+        client = self._get_async_client()
+
+        # 根据是否有加密载荷决定请求模式
+        if enc_payload:
+            # 加密模式
+            print("[DEBUG] Using encrypted request mode for g_token")
+            body_bytes = base64.b64decode(enc_payload)
+
+            app_head = {
+                "X-Platform": "Android",
+                "X-ProductVersion": nsoapp_version,
+                "X-znca-Client-Version": znca_client_version,
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/octet-stream",
+                "Accept": "application/octet-stream, application/json",
+                "Accept-Encoding": "gzip",
+                "User-Agent": f"com.nintendo.znca/{nsoapp_version}(Android/14)",
+            }
+
+            resp = await client.post(url, headers=app_head, content=body_bytes)
+
+            # 解密响应
+            decrypt_resp = await self.f_decrypt_response(resp.content)
+            decrypt_json = decrypt_resp.json()
+            web_service_resp = json.loads(decrypt_json["data"])
+        else:
+            # v4 API 强制加密，若未获取到加密载荷则为异常
+            raise ValueError(
+                "Failed to get encrypted payload from f-API for g_token. "
+                "v4 API requires encryption. Check OAuth client_id and scope."
+            )
+
         try:
             return web_service_resp["result"]["accessToken"]
         except (KeyError, TypeError):
@@ -500,17 +573,26 @@ class NSOAuth:
         api_body = {
             "grant_type": "client_credentials",
             "client_id": F_GEN_OAUTH_CLIENT_ID,
-            "scope": "ca:gf",
+            "scope": "ca:gf ca:er ca:dr",  # 添加 ca:er ca:dr scope 用于加密/解密
         }
-        
+
         client = self._get_async_client()
         resp = await client.post(F_GEN_OAUTH_URL, headers=api_head, data=api_body)
         data = resp.json()
         self.oauth_token = data.get("access_token")
 
+        if self.oauth_token:
+            print(f"[DEBUG] ✅ OAuth token received: {self.oauth_token[:20]}...")
+        else:
+            print(f"[DEBUG] ❌ No access_token in response!")
+            if "error" in data:
+                print(f"[DEBUG] OAuth Error: {data.get('error')}")
+                print(f"[DEBUG] Error description: {data.get('error_description')}")
+
         # 捕获 nxapi-auth 返回的客户端版本（若提供），满足 3.1.0+ 的随机版本要求
         client_ver = data.get("client_version") or data.get("znca_client_version")
         if client_ver:
+            print(f"[DEBUG] Client version from OAuth: {client_ver}")
             global ZNCA_CLIENT_VERSION
             ZNCA_CLIENT_VERSION = client_ver
     
@@ -520,18 +602,20 @@ class NSOAuth:
         step: int,
         r_user_id: str,
         coral_user_id: Optional[str] = None,
-    ) -> Tuple[str, str, int]:
+        encrypt_token_request: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, str, int, Optional[str]]:
         """
         调用 f-API（参照 S3S.call_f_api()）
-        
+
         Args:
             access_token: NSO access token or ID token
             step: 1 for coral token, 2 for web service token
             r_user_id: Nintendo account user ID
             coral_user_id: Coral user ID (step 2 需要)
-            
+            encrypt_token_request: 可选的加密请求信息 (url + parameter)
+
         Returns:
-            (f_token, uuid, timestamp)
+            (f_token, uuid, timestamp, encrypted_payload_base64_or_none)
         """
         if not self.oauth_token:
             await self.f_api_client_auth2_register()
@@ -547,33 +631,118 @@ class NSOAuth:
             "X-znca-Client-Version": znca_client_version,
             "Authorization": f"Bearer {self.oauth_token}",
         }
-        
+
         api_body = {
             "token": access_token,
             "hash_method": step,
             "na_id": r_user_id,
         }
-        
+
         if step == 2 and coral_user_id:
             api_body["coral_user_id"] = str(coral_user_id)
-        
+
+        if encrypt_token_request:
+            api_body["encrypt_token_request"] = encrypt_token_request
+
         client = self._get_async_client()
         resp = await client.post(F_GEN_URL, headers=api_head, json=api_body)
-        data = resp.json()
-        
+
+        # Check status code
+        if resp.status_code != 200:
+            raise ValueError(f"f-API failed with status {resp.status_code}: {resp.text[:200]}")
+
+        try:
+            data = resp.json()
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse f-API response: {str(e)}, body: {resp.text[:200]}")
+
         # Handle token expiration
         if data.get("error") == "invalid_token":
             await self.f_api_client_auth2_register()
             api_head["Authorization"] = f"Bearer {self.oauth_token}"
             api_head["X-znca-Client-Version"] = self.get_znca_client_version()
             resp = await client.post(F_GEN_URL, headers=api_head, json=api_body)
-            data = resp.json()
-        
+
+            if resp.status_code != 200:
+                raise ValueError(f"f-API retry failed with status {resp.status_code}: {resp.text[:200]}")
+
+            try:
+                data = resp.json()
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Failed to parse f-API retry response: {str(e)}, body: {resp.text[:200]}")
+
         if "error" in data:
             raise ValueError(f"f-API error: {data}")
-        
-        return data["f"], data["request_id"], data["timestamp"]
-    
+
+        print(f"[DEBUG] f-API response: {data}")
+        # nxapi 若启用加密，会返回加密载荷（优先检查 encrypted_token_request）
+        enc_payload = (
+            data.get("encrypted_token_request")
+            or data.get("encrypted")
+            or data.get("encrypt_request")
+            or data.get("request")
+        )
+        return data["f"], data["request_id"], data["timestamp"], enc_payload
+
+    async def f_decrypt_response(self, encrypted_data: bytes) -> httpx.Response:
+        """
+        调用 nxapi /decrypt-response 解密加密响应（参照 S3S.f_decrypt_response()）
+
+        Args:
+            encrypted_data: 加密的响应数据（bytes）
+
+        Returns:
+            解密后的响应对象，其 .json() 返回 {"data": "..."}
+        """
+        if not self.oauth_token:
+            await self.f_api_client_auth2_register()
+
+        nsoapp_version = self.get_nsoapp_version()
+        znca_client_version = self.get_znca_client_version()
+
+        api_head = {
+            "User-Agent": F_USER_AGENT,
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json; charset=utf-8",
+            "X-znca-Platform": "Android",
+            "X-znca-Version": nsoapp_version,
+            "X-znca-Client-Version": znca_client_version,
+            "Authorization": f"Bearer {self.oauth_token}",
+        }
+
+        api_body = {
+            "data": base64.b64encode(encrypted_data).decode("utf-8"),
+        }
+
+        client = self._get_async_client()
+        decrypt_url = F_GEN_URL.replace("/f", "/decrypt-response")
+
+        resp = await client.post(decrypt_url, headers=api_head, json=api_body)
+
+        # Handle token expiration
+        if resp.status_code == 401:
+            data = resp.json()
+            if data.get("error") == "invalid_token":
+                await self.f_api_client_auth2_register()
+                api_head["Authorization"] = f"Bearer {self.oauth_token}"
+                api_head["X-znca-Client-Version"] = self.get_znca_client_version()
+                resp = await client.post(decrypt_url, headers=api_head, json=api_body)
+
+        # Check for errors
+        if resp.status_code != 200:
+            raise ValueError(f"Decrypt failed with status {resp.status_code}: {resp.text[:200]}")
+
+        try:
+            data = resp.json()
+            if "error" in data:
+                raise ValueError(f"Decrypt error: {data}")
+            if "data" not in data:
+                raise ValueError(f"Decrypt response missing 'data' field: {data}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse decrypt response: {str(e)}, body: {resp.text[:200]}")
+
+        return resp
+
     async def close(self) -> None:
         """关闭 async client"""
         if self.async_client:

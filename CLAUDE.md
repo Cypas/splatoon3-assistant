@@ -12,6 +12,14 @@ Splatoon3 游戏助手 - 通过获取 Splatoon3 的战斗数据及其他辅助�
 
 > **注意**: 不要直接引用 `../reference-project` 下的代码，如需引用则将代码复制到本项目中。
 
+### 重要说明：nxapi OAuth Client ID
+
+- `F_GEN_OAUTH_CLIENT_ID`（在 `src/nso_auth.py` 中）是每个作者在 nxapi 上注册的独立权限 ID
+- **不同项目有各自的 Client ID，无需与参考项目保持一致**
+- 本项目使用自己注册的 Client ID：`EJ5mqnRSwmWfOPmRDIRGwg`
+- 参考项目 splatoon3-nso 使用：`Orh4jxABP3D3jYaBFgL9Ug`
+- 在对比参考项目时，应忽略此字段的差异
+
 ---
 
 ## 项目结构
@@ -98,6 +106,15 @@ python tests/test_full_flow.py
 ---
 
 ## 开发日志
+
+### 2024-12-12: v4 API 加密支持
+
+**完成项目**:
+- [x] 升级到 v4 API (`/v4/Account/Login` 和 `/v4/Game/GetWebServiceToken`)
+- [x] 实现 nxapi 加密/解密功能（`encrypt_token_request` 和 `f_decrypt_response`）
+- [x] 移除 msgpack 依赖，使用 base64 处理加密载荷
+- [x] 增强错误处理（状态码校验、JSON 解析错误、加密载荷验证）
+- [x] OAuth scope 扩展：`ca:gf` → `ca:gf ca:er ca:dr`
 
 ### 2024-12-10: NSO API 集成完成
 
